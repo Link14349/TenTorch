@@ -12,6 +12,8 @@
 // Build and load through FreeFermion/cuda/fermion.py (torch.utils.cpp_extension.load).
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <cuComplex.h>
 #include <cstdint>
@@ -202,6 +204,9 @@ torch::Tensor pfaffian(torch::Tensor matrices) {
                     || matrices.scalar_type() == torch::kFloat64,
                 "pfaffian expects a float64 or complex128 tensor");
     TORCH_CHECK(matrices.dim() >= 3, "pfaffian expects (..., m, m) with a batch dimension");
+    TORCH_CHECK(matrices.size(-2) == matrices.size(-1),
+                "pfaffian expects square matrices");
+    const c10::cuda::CUDAGuard device_guard(matrices.device());
     const bool real_input = matrices.scalar_type() == torch::kFloat64;
     auto source = real_input ? matrices.to(torch::kComplexDouble).contiguous()
                              : matrices.contiguous();
@@ -212,6 +217,9 @@ torch::Tensor pfaffian(torch::Tensor matrices) {
         count *= extent;
     }
     auto results = torch::empty(batch, source.options());
+    if (count == 0) {
+        return real_input ? at::real(results) : results;
+    }
     if (size % 2 != 0) {
         results.zero_();
     } else if (size == 0) {
@@ -222,16 +230,23 @@ torch::Tensor pfaffian(torch::Tensor matrices) {
             reinterpret_cast<const cuDoubleComplex*>(source.data_ptr<c10::complex<double>>()),
             reinterpret_cast<cuDoubleComplex*>(results.data_ptr<c10::complex<double>>()),
             size, 1e-12);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
     return real_input ? at::real(results) : results;
 }
 
 torch::Tensor operator_vectors(torch::Tensor coeff, torch::Tensor codes) {
     TORCH_CHECK(coeff.is_cuda() && codes.is_cuda(), "operator_vectors expects CUDA tensors");
+    TORCH_CHECK(coeff.device() == codes.device(),
+                "operator_vectors expects coeff and codes on the same CUDA device");
     TORCH_CHECK(coeff.scalar_type() == torch::kComplexDouble,
                 "operator_vectors expects a complex128 coeff");
     TORCH_CHECK(codes.scalar_type() == torch::kInt64, "operator_vectors expects int64 codes");
-    TORCH_CHECK(codes.size(-1) == 2, "operator_vectors expects codes of shape (..., m, 2)");
+    TORCH_CHECK(coeff.dim() == 2 && coeff.size(1) == 2 * coeff.size(0),
+                "operator_vectors expects coeff of shape (n, 2n)");
+    TORCH_CHECK(codes.dim() >= 2 && codes.size(-1) == 2,
+                "operator_vectors expects codes of shape (..., m, 2)");
+    const c10::cuda::CUDAGuard device_guard(coeff.device());
     auto coefficient = coeff.contiguous();
     auto code = codes.contiguous();
     const int num_modes = (int)coefficient.size(0);
@@ -249,6 +264,7 @@ torch::Tensor operator_vectors(torch::Tensor coeff, torch::Tensor codes) {
         code.data_ptr<int64_t>(),
         reinterpret_cast<cuDoubleComplex*>(vectors.data_ptr<c10::complex<double>>()),
         num_modes, coeff_stride, rows);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return vectors;
 }
 
@@ -257,10 +273,11 @@ torch::Tensor vacuum_contraction(torch::Tensor vectors, int64_t num_modes) {
     TORCH_CHECK(vectors.scalar_type() == torch::kComplexDouble,
                 "vacuum_contraction expects a complex128 tensor");
     TORCH_CHECK(vectors.dim() >= 3, "vacuum_contraction expects (..., m, 2n)");
+    TORCH_CHECK(vectors.size(-1) == 2 * num_modes,
+                "vacuum_contraction expects vectors of length 2 * num_modes");
+    const c10::cuda::CUDAGuard device_guard(vectors.device());
     auto source = vectors.contiguous();
     const int length = (int)source.size(-2);
-    TORCH_CHECK(source.size(-1) == 2 * num_modes,
-                "vacuum_contraction expects vectors of length 2 * num_modes");
     std::vector<int64_t> batch(source.sizes().begin(), source.sizes().end() - 2);
     int64_t count = 1;
     for (int64_t extent : batch) {
@@ -277,6 +294,7 @@ torch::Tensor vacuum_contraction(torch::Tensor vectors, int64_t num_modes) {
         reinterpret_cast<const cuDoubleComplex*>(source.data_ptr<c10::complex<double>>()),
         reinterpret_cast<cuDoubleComplex*>(matrices.data_ptr<c10::complex<double>>()),
         (int)num_modes, length);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return matrices;
 }
 
