@@ -28,6 +28,7 @@
 // Build and load through CGO/cuda/project.py (torch.utils.cpp_extension.load).
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <cuComplex.h>
 #include <cstdint>
@@ -168,6 +169,7 @@ torch::Tensor project(torch::Tensor rotation,
                       torch::Tensor offsets,
                       torch::Tensor coefficients) {
     TORCH_CHECK(rotation.is_cuda(), "rotation must be on CUDA");
+    const c10::cuda::CUDAGuard device_guard(rotation.device());
     TORCH_CHECK(rotation.scalar_type() == torch::kFloat64, "rotation must be float64");
     TORCH_CHECK(rotation.dim() == 2 && rotation.size(0) == rotation.size(1),
                 "rotation must be square, got ", rotation.sizes());
